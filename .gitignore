@@ -1,0 +1,8 @@
+# Only the sources are kept: the README, our Mesa patches, the scripts and the tools.
+# Builds, driver zips, APK trees and measurement outputs (out/, *-tree*/, replay-*/, commit-check/) stay local.
+/*
+!/.gitignore
+!/README.md
+!/patches/
+!/scripts/
+!/tools/

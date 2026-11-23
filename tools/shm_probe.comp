@@ -1,0 +1,19 @@
+#version 450
+// Shared-memory size probe: one workgroup of 64 invocations fills WORDS words of shared memory with a pattern
+// (each word written by one invocation), then every invocation checks other invocations' words. The result
+// buffer gets, per 4 KiB block of shared memory, the number of words that read back wrong.
+// Compiled with -DWORDS=16384 (64 KiB) and -DWORDS=8192 (32 KiB).
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) buffer Result { uint bad[]; } res;   // bad[0..15]: per 4 KiB block; bad[16]: total checked
+shared uint s[WORDS];
+uint pattern(uint j) { return (j * 2654435761u) ^ 0xA5A5A5A5u; }
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    for (uint j = i; j < WORDS; j += 64u) s[j] = pattern(j);
+    barrier();
+    uint other = (i + 17u) & 63u;   // read words another invocation wrote
+    for (uint j = other; j < WORDS; j += 64u) {
+        if (s[j] != pattern(j)) atomicAdd(res.bad[j / 1024u], 1u);
+        atomicAdd(res.bad[16], 1u);
+    }
+}

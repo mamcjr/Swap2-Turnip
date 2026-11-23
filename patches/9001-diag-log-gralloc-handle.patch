@@ -1,0 +1,24 @@
+diff --git a/src/util/u_gralloc/u_gralloc_fallback.c b/src/util/u_gralloc/u_gralloc_fallback.c
+index 44fb32d8cfd..c59b42cc74d 100644
+--- a/src/util/u_gralloc/u_gralloc_fallback.c
++++ b/src/util/u_gralloc/u_gralloc_fallback.c
+@@ -155,6 +155,19 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
+       out->modifier = ubwc ? DRM_FORMAT_MOD_QCOM_COMPRESSED : DRM_FORMAT_MOD_LINEAR;
+    }
+ #endif
++   {   /* Swap2-Turnip diagnostic: the handle's layout, a few times */
++      static int logged;
++      if (logged < 4) {
++         logged++;
++         const int *d = hnd->handle->data;
++         int nf = hnd->handle->numFds, ni = hnd->handle->numInts;
++         mesa_logi("fallback gralloc: hal_format %d stride %d numFds %d numInts %d ints %08x %08x %08x %08x %08x %08x %08x %08x modifier 0x%llx",
++                   hnd->hal_format, hnd->pixel_stride, nf, ni,
++                   ni > 0 ? d[nf] : 0, ni > 1 ? d[nf + 1] : 0, ni > 2 ? d[nf + 2] : 0, ni > 3 ? d[nf + 3] : 0,
++                   ni > 4 ? d[nf + 4] : 0, ni > 5 ? d[nf + 5] : 0, ni > 6 ? d[nf + 6] : 0, ni > 7 ? d[nf + 7] : 0,
++                   (unsigned long long)out->modifier);
++      }
++   }
+ 
+    return 0;
+ }

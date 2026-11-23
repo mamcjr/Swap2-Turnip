@@ -1,0 +1,103 @@
+diff --git a/src/freedreno/ir3/ir3_ra.c b/src/freedreno/ir3/ir3_ra.c
+index 02706b073a2..88a86f53f4a 100644
+--- a/src/freedreno/ir3/ir3_ra.c
++++ b/src/freedreno/ir3/ir3_ra.c
+@@ -5,6 +5,8 @@
+  */
+ 
+ #include "ir3_ra.h"
++#include "util/os_misc.h"
++#include <stdlib.h>
+ #include "util/rb_tree.h"
+ #include "util/u_math.h"
+ #include "ir3_shader.h"
+@@ -2833,6 +2835,18 @@ ir3_ra(struct ir3_shader_variant *v)
+    if (ir3_shader_debug & IR3_DBG_SPILLALL)
+       calc_min_limit_pressure(v, live, &limit_pressure);
+ 
++   /* Swap2 diagnostic (IR3_CS_REGS, Android property debug.mesa.ir3.cs.regs): a compute shader's full registers capped at that many vec4s,
++    * spilling the rest, to trade spills for waves (fewer registers a wave, more waves resident). Never below one instruction's own footprint. */
++   if (mesa_shader_stage_is_compute(v->type)) {
++      static int cs_regs = -1;
++      if (cs_regs < 0) { const char *o = os_get_option("IR3_CS_REGS"); cs_regs = o ? atoi(o) : 0; }
++      if (cs_regs > 0 && (unsigned)cs_regs * 2 * 4 < limit_pressure.full) {
++         struct ir3_pressure min_p;
++         calc_min_limit_pressure(v, live, &min_p);
++         limit_pressure.full = MAX2((unsigned)cs_regs * 2 * 4, min_p.full);
++      }
++   }
++
+    /* In the worst case, each half register could block one full register, so
+     * add shared_half in case of fragmentation. In addition, full registers can
+     * block half registers so we have to consider the total pressure against the
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index ca3fca595d5..4d946f63177 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -354,6 +354,29 @@ tu_emit_rt_workaround(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    tu_cs_emit(cs, A6XX_CP_SET_MARKER_0_RT_WA_END);
+ }
+ 
++/* Swap2 diagnostics: wait-for-idles emitted by barriers, outside ([0]) and inside ([1]) render passes, logged every 3000 submissions
++ * (swap2_wfi_submit, tu_queue); debug.mesa.tu.rp.nowfi=1 drops the ones inside render passes (an incorrect picture is possible: a bound on what they cost) */
++#include <atomic>
++#include "util/os_misc.h"
++static std::atomic<uint64_t> swap2_wfi[2];
++static void swap2_wfi_count(int in_pass) { swap2_wfi[in_pass].fetch_add(1, std::memory_order_relaxed); }
++static int swap2_rp_nowfi(void)
++{
++   static int v = -1, n;
++   if (v < 0 || !(++n & 1023)) { const char *o = os_get_option("TU_RP_NOWFI"); v = o && o[0] == '1'; }
++   return v;
++}
++void swap2_wfi_submit(void);
++void swap2_wfi_submit(void)
++{
++   static std::atomic<uint64_t> subs; static uint64_t last[2];
++   if ((subs.fetch_add(1, std::memory_order_relaxed) + 1) % 3000) return;
++   uint64_t a = swap2_wfi[0].load(), b = swap2_wfi[1].load();
++   mesa_logi("swap2: wait-for-idles from barriers in the last 3000 submissions: %llu outside render passes, %llu inside (nowfi %d)",
++             (unsigned long long)(a - last[0]), (unsigned long long)(b - last[1]), swap2_rp_nowfi());
++   last[0] = a; last[1] = b;
++}
++
+ template <chip CHIP>
+ static void
+ tu6_emit_flushes(struct tu_cmd_buffer *cmd_buffer,
+@@ -460,8 +483,10 @@ tu6_emit_flushes(struct tu_cmd_buffer *cmd_buffer,
+          tu_emit_event_write<CHIP>(cmd_buffer, cs, FD_SUBPASS_FENCE);
+       }
+    }
+-   if (flushes & TU_CMD_FLAG_WAIT_FOR_IDLE)
++   if (flushes & TU_CMD_FLAG_WAIT_FOR_IDLE) {
+       tu_cs_emit_wfi(cs);
++      swap2_wfi_count(cs == &cmd_buffer->draw_cs ? 1 : 0);
++   }
+    if (flushes & TU_CMD_FLAG_WAIT_FOR_ME)
+       tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+ }
+@@ -638,6 +663,8 @@ tu_emit_cache_flush_renderpass(struct tu_cmd_buffer *cmd_buffer)
+    if (cache->flush_bits & TU_CMD_FLAG_BLIT_CACHE_CLEAN) {
+       cmd_buffer->state.blit_cache_cleaned = true;
+    }
++   if (swap2_rp_nowfi())
++      cache->flush_bits &= ~TU_CMD_FLAG_WAIT_FOR_IDLE;
+    tu6_emit_flushes<CHIP>(cmd_buffer, cs, cache);
+ }
+ TU_GENX(tu_emit_cache_flush_renderpass);
+diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
+index 225ef8b8fe1..0e31b47de99 100644
+--- a/src/freedreno/vulkan/tu_queue.cc
++++ b/src/freedreno/vulkan/tu_queue.cc
+@@ -413,9 +413,11 @@ out:
+    return result;
+ }
+ 
++void swap2_wfi_submit(void);   /* tu_cmd_buffer.cc */
+ static VkResult
+ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+ {
++   swap2_wfi_submit();
+    MESA_TRACE_FUNC();
+    struct tu_queue *queue = list_entry(_queue, struct tu_queue, vk);
+    struct tu_device *device = queue->device;

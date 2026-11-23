@@ -1,0 +1,87 @@
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 103790a4433..be4632b3ecb 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "tu_shader.h"
++#include "util/os_misc.h"
+ 
+ #include <initializer_list>
+ 
+@@ -3477,6 +3478,46 @@ tu_shader_deserialize(struct vk_pipeline_cache *cache,
+    return &shader->base;
+ }
+ 
++/* Swap2 diagnostic (TU_SSBO_RO_AUTO=1, Android property debug.mesa.tu.ssbo.ro.auto): a storage buffer variable that no store or atomic of the
++ * shader reaches is taken as NonWritable, as a module could declare it, so its loads may use isam (the texture path) instead of ldib. Only when
++ * every storage buffer write of the shader names its variable. Not conformant: another binding (or a buffer device address) over the same
++ * memory may be written by the shader; it measures what the decorations would give */
++static void
++swap2_ssbo_ro_auto(nir_shader *nir)
++{
++   static int on = -1;
++   if (on < 0) { const char *o = os_get_option("TU_SSBO_RO_AUTO"); on = o && o[0] == '1'; }
++   if (!on)
++      return;
++   struct set *written = _mesa_pointer_set_create(NULL);
++   bool unknown = false;
++   nir_foreach_function_impl (impl, nir) {
++      nir_foreach_block (block, impl) {
++         nir_foreach_instr (instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
++            int src = -1;
++            switch (in->intrinsic) {
++            case nir_intrinsic_store_ssbo: src = 1; break;
++            case nir_intrinsic_ssbo_atomic:
++            case nir_intrinsic_ssbo_atomic_swap: src = 0; break;
++            default: break;
++            }
++            if (src < 0)
++               continue;
++            const nir_variable *var = nir_get_binding_variable(nir, nir_chase_binding(in->src[src]));
++            if (var) _mesa_set_add(written, var); else unknown = true;
++         }
++      }
++   }
++   if (!unknown)
++      nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo)
++         if (!_mesa_set_search(written, var))
++            var->data.access |= ACCESS_NON_WRITEABLE;
++   _mesa_set_destroy(written, NULL);
++}
++
+ void
+ tu_lower_nir(struct tu_device *dev,
+              nir_shader *nir,
+@@ -3487,6 +3528,27 @@ tu_lower_nir(struct tu_device *dev,
+    const nir_opt_access_options access_options = {
+       .is_vulkan = true,
+    };
++   /* Swap2 diagnostic (TU_SSBO_RESTRICT=1, Android property debug.mesa.tu.ssbo.restrict): every storage buffer variable taken as Restrict, so one
++    * the shader never writes is inferred read-only (nir_opt_access) and its loads may go through isam, the texture path, instead of ldib. Not
++    * conformant in general (a buffer written through another binding of the same shader would be read stale): it measures what NonWritable /
++    * Restrict decorations in the module would give */
++   {
++      static int restrict_ssbo = -1;
++      if (restrict_ssbo < 0) { const char *o = os_get_option("TU_SSBO_RESTRICT"); restrict_ssbo = o && o[0] == '1'; }
++      if (restrict_ssbo)
++         nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo)
++            var->data.access |= ACCESS_RESTRICT;
++      /* TU_SSBO_RO=<name>,<name>...: those storage buffer variables taken as NonWritable, as if the module said so (offline experiments) */
++      const char *ro = os_get_option("TU_SSBO_RO");
++      if (ro && *ro)
++         nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
++            if (!var->name) continue;
++            size_t n = strlen(var->name);
++            for (const char *p = ro; (p = strstr(p, var->name)); p += n)
++               if ((p == ro || p[-1] == ',') && (p[n] == ',' || !p[n])) { var->data.access |= ACCESS_NON_WRITEABLE; break; }
++         }
++   }
++   swap2_ssbo_ro_auto(nir);
+    NIR_PASS(_, nir, nir_opt_access, &access_options);
+ 
+    bool has_hw_multiview =

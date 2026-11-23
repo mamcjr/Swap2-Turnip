@@ -1,0 +1,21 @@
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index 76e4f4afedd..c5ad33d2c27 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -129,7 +129,15 @@ tu_env_deinit(void)
+ static void
+ tu_env_init_once(void)
+ {
+-   tu_env.start_debug = tu_env.debug = parse_debug_string(os_get_option("TU_DEBUG"), tu_debug_options);
++   const char *debug = os_get_option("TU_DEBUG");
++#ifdef TU_DEBUG_DEFAULT
++   /* a build's default (diagnostic builds): an app that loads the driver before it sets its environment cannot pass TU_DEBUG */
++#define TU_STR2(x) #x
++#define TU_STR(x) TU_STR2(x)
++   if (!debug)
++      debug = TU_STR(TU_DEBUG_DEFAULT);
++#endif
++   tu_env.start_debug = tu_env.debug = parse_debug_string(debug, tu_debug_options);
+ 
+    if (TU_DEBUG(STARTUP))
+       mesa_logi("TU_DEBUG=0x%" PRIx64, tu_env.debug.load());

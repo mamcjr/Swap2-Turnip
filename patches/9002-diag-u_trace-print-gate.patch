@@ -1,0 +1,46 @@
+diff --git a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
+index b2fb611b86b..50301ce3fb8 100644
+--- a/src/util/perf/u_trace.c
++++ b/src/util/perf/u_trace.c
+@@ -904,6 +904,24 @@ print_ranges(struct u_trace_context *utctx, struct hash_table *ranges, uint32_t
+    ralloc_free(ctx);
+ }
+ 
++#if DETECT_OS_ANDROID
++#include <sys/system_properties.h>
++/* Diagnostic (turnip-swap2 9002): the print/CSV/JSON output only while the property debug.mesa.gpu.traces.on is
++ * not "0", read once per flush, so a run prints one window of its frames (setprop from adb) instead of all of them. */
++static bool
++u_trace_print_gate(void)
++{
++   char v[PROP_VALUE_MAX];
++   return __system_property_get("debug.mesa.gpu.traces.on", v) <= 0 || v[0] != '0';
++}
++#else
++static bool
++u_trace_print_gate(void)
++{
++   return true;
++}
++#endif
++
+ static void
+ process_flush(void *job, void *gdata, int thread_index)
+ {
+@@ -939,6 +957,7 @@ process_flush(void *job, void *gdata, int thread_index)
+       simple_mtx_unlock(&shared_out_mtx);
+    }
+ 
++   const bool print_on = u_trace_print_gate();
+    uint64_t last_timestamp = 0;
+    struct u_trace_buffer_view last_timestamp_view = {
+       .buffer_index = UINT32_MAX,
+@@ -1026,7 +1045,7 @@ process_flush(void *job, void *gdata, int thread_index)
+          indirect_data = utctx->dummy_indirect_data;
+       }
+ 
+-      if (utctx->out) {
++      if (utctx->out && print_on) {
+          simple_mtx_lock(&shared_out_mtx);
+          utctx->out_printer->event(utctx, event, timestamp, delta, indirect_data);
+          simple_mtx_unlock(&shared_out_mtx);

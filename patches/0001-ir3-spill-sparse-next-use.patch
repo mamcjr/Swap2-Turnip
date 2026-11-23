@@ -1,0 +1,194 @@
+diff --git a/src/freedreno/ir3/ir3_spill.c b/src/freedreno/ir3/ir3_spill.c
+index 503f49cf401..e25515d8049 100644
+--- a/src/freedreno/ir3/ir3_spill.c
++++ b/src/freedreno/ir3/ir3_spill.c
+@@ -66,9 +66,16 @@ struct ra_spill_interval {
+    bool can_rematerialize;
+ };
+ 
++/* Next-use distances of the values in one liveness set, by SSA name (sorted) */
++struct ra_spill_next_use {
++   unsigned count;
++   unsigned *names;
++   unsigned *dist;
++};
++
+ struct ra_spill_block_state {
+-   unsigned *next_use_end;
+-   unsigned *next_use_start;
++   struct ra_spill_next_use next_use_end;   /* the block's live-out values */
++   struct ra_spill_next_use next_use_start; /* its live-in values */
+ 
+    unsigned cycles;
+ 
+@@ -197,13 +204,54 @@ instr_cycles(struct ir3_instruction *instr)
+    return 1 + instr->repeat;
+ }
+ 
++/* The next-use distances at a block's start and end are kept only for the
++ * values live there (the liveness sets): every other value's distance is
++ * UINT_MAX by construction. Dense per-block arrays over every SSA definition
++ * cost blocks * definitions * 8 bytes, which for a large shader with many
++ * blocks is gigabytes (12,707 blocks and 37,700 definitions: 3.6 GiB), and on
++ * Android each array is a separate mapping of the allocator, enough to exhaust
++ * vm.max_map_count.
++ */
++static int
++cmp_name(const void *a, const void *b)
++{
++   unsigned x = *(const unsigned *)a, y = *(const unsigned *)b;
++   return x < y ? -1 : x > y;
++}
++
++static unsigned *
++next_use_ref(const struct ra_spill_next_use *nu, unsigned name)
++{
++   const unsigned *p = bsearch(&name, nu->names, nu->count, sizeof(unsigned),
++                               cmp_name);
++   return p ? &nu->dist[p - nu->names] : NULL;
++}
++
++static void
++next_use_init(struct ra_spill_ctx *ctx, struct ra_spill_next_use *nu,
++              const BITSET_WORD *set)
++{
++   unsigned n = 0, k = 0, name;
++   BITSET_FOREACH_SET (name, set, ctx->live->definitions_count)
++      n++;
++   nu->count = n;
++   nu->names = ralloc_array(ctx, unsigned, n);
++   nu->dist = ralloc_array(ctx, unsigned, n);
++   BITSET_FOREACH_SET (name, set, ctx->live->definitions_count) {
++      nu->names[k] = name;
++      nu->dist[k] = UINT_MAX;
++      k++;
++   }
++}
++
+ static bool
+ compute_block_next_distance(struct ra_spill_ctx *ctx, struct ir3_block *block,
+                             unsigned *tmp_next_use)
+ {
+    struct ra_spill_block_state *state = &ctx->blocks[block->index];
+-   memcpy(tmp_next_use, state->next_use_end,
+-          ctx->live->definitions_count * sizeof(*tmp_next_use));
++   /* tmp_next_use is all UINT_MAX on entry, and is left so on return */
++   for (unsigned k = 0; k < state->next_use_end.count; k++)
++      tmp_next_use[state->next_use_end.names[k]] = state->next_use_end.dist[k];
+ 
+    unsigned cycle = state->cycles;
+    foreach_instr_rev (instr, &block->instr_list) {
+@@ -238,8 +286,22 @@ compute_block_next_distance(struct ra_spill_ctx *ctx, struct ir3_block *block,
+       }
+    }
+ 
+-   memcpy(state->next_use_start, tmp_next_use,
+-          ctx->live->definitions_count * sizeof(*tmp_next_use));
++   for (unsigned k = 0; k < state->next_use_start.count; k++)
++      state->next_use_start.dist[k] =
++         tmp_next_use[state->next_use_start.names[k]];
++
++   /* Restore tmp_next_use: the only entries the walk can have left finite are
++    * the live-in values, the live-out values it was seeded with, and the
++    * values the block's instructions name.
++    */
++   for (unsigned k = 0; k < state->next_use_end.count; k++)
++      tmp_next_use[state->next_use_end.names[k]] = UINT_MAX;
++   foreach_instr (instr, &block->instr_list) {
++      ra_foreach_src (src, instr)
++         tmp_next_use[src->def->name] = UINT_MAX;
++      ra_foreach_dst (dst, instr)
++         tmp_next_use[dst->name] = UINT_MAX;
++   }
+ 
+    bool progress = false;
+    for (unsigned i = 0; i < block->predecessors_count; i++) {
+@@ -254,12 +316,22 @@ compute_block_next_distance(struct ra_spill_ctx *ctx, struct ir3_block *block,
+       bool loop_exit = pred->loop_depth < block->loop_depth;
+       unsigned block_distance = pred_state->cycles + (loop_exit ? 100000 : 0);
+ 
+-      for (unsigned j = 0; j < ctx->live->definitions_count; j++) {
+-         if (state->next_use_start[j] < UINT_MAX &&
+-             state->next_use_start[j] + block_distance <
+-             pred_state->next_use_end[j]) {
+-            pred_state->next_use_end[j] = state->next_use_start[j] +
+-               block_distance;
++      /* A value live into the block is live out of every predecessor: both
++       * name lists are sorted, so one merge walk finds them.
++       */
++      const struct ra_spill_next_use *in = &state->next_use_start;
++      struct ra_spill_next_use *out = &pred_state->next_use_end;
++      for (unsigned k = 0, o = 0; k < in->count; k++) {
++         unsigned d = in->dist[k];
++         if (d == UINT_MAX)
++            continue;
++         while (o < out->count && out->names[o] < in->names[k])
++            o++;
++         assert(o < out->count && out->names[o] == in->names[k]);
++         if (o == out->count || out->names[o] != in->names[k])
++            continue;
++         if (d + block_distance < out->dist[o]) {
++            out->dist[o] = d + block_distance;
+             progress = true;
+          }
+       }
+@@ -269,12 +341,14 @@ compute_block_next_distance(struct ra_spill_ctx *ctx, struct ir3_block *block,
+             break;
+          if (!phi->srcs[i]->def)
+             continue;
+-         unsigned src = phi->srcs[i]->def->name;
+-         if (phi->dsts[0]->next_use < UINT_MAX &&
+-             phi->dsts[0]->next_use + block_distance <
+-             pred_state->next_use_end[src]) {
+-            pred_state->next_use_end[src] = phi->dsts[0]->next_use +
+-               block_distance;
++         if (phi->dsts[0]->next_use == UINT_MAX)
++            continue;
++         /* phi sources are live out of their predecessor (ir3_liveness.c) */
++         unsigned *end = next_use_ref(&pred_state->next_use_end,
++                                      phi->srcs[i]->def->name);
++         assert(end);
++         if (end && phi->dsts[0]->next_use + block_distance < *end) {
++            *end = phi->dsts[0]->next_use + block_distance;
+             progress = true;
+          }
+       }
+@@ -287,15 +361,8 @@ static void
+ compute_next_distance(struct ra_spill_ctx *ctx, struct ir3 *ir)
+ {
+    for (unsigned i = 0; i < ctx->live->block_count; i++) {
+-      ctx->blocks[i].next_use_start =
+-         ralloc_array(ctx, unsigned, ctx->live->definitions_count);
+-      ctx->blocks[i].next_use_end =
+-         ralloc_array(ctx, unsigned, ctx->live->definitions_count);
+-
+-      for (unsigned j = 0; j < ctx->live->definitions_count; j++) {
+-         ctx->blocks[i].next_use_start[j] = UINT_MAX;
+-         ctx->blocks[i].next_use_end[j] = UINT_MAX;
+-      }
++      next_use_init(ctx, &ctx->blocks[i].next_use_start, ctx->live->live_in[i]);
++      next_use_init(ctx, &ctx->blocks[i].next_use_end, ctx->live->live_out[i]);
+    }
+ 
+    foreach_block (block, &ir->block_list) {
+@@ -311,6 +378,8 @@ compute_next_distance(struct ra_spill_ctx *ctx, struct ir3 *ir)
+ 
+    unsigned *tmp_next_use =
+       ralloc_array(ctx, unsigned, ctx->live->definitions_count);
++   for (unsigned j = 0; j < ctx->live->definitions_count; j++)
++      tmp_next_use[j] = UINT_MAX;
+ 
+    bool progress = true;
+    while (progress) {
+@@ -1345,8 +1414,9 @@ handle_live_in(struct ra_spill_ctx *ctx, struct ir3_block *block,
+    struct ra_spill_interval *interval = ctx->intervals[def->name];
+    ra_spill_interval_init(interval, def);
+    if (ctx->spilling) {
+-      interval->next_use_distance =
+-         ctx->blocks[block->index].next_use_start[def->name];
++      unsigned *start = next_use_ref(&ctx->blocks[block->index].next_use_start,
++                                     def->name);
++      interval->next_use_distance = start ? *start : UINT_MAX;
+    }
+ 
+    ra_spill_ctx_insert(ctx, interval);

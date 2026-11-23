@@ -1,0 +1,506 @@
+diff --git a/src/util/u_gralloc/meson.build b/src/util/u_gralloc/meson.build
+index 991e02f3c43..6f1db72242a 100644
+--- a/src/util/u_gralloc/meson.build
++++ b/src/util/u_gralloc/meson.build
+@@ -15,6 +15,7 @@ files_u_gralloc = files(
+   'u_gralloc_cros_api.c',
+   'u_gralloc_libdrm.c',
+   'u_gralloc_qcom.c',
++  'u_gralloc_aimapper.c',
+ )
+ 
+ if dep_android_ui.found()
+diff --git a/src/util/u_gralloc/u_gralloc.c b/src/util/u_gralloc/u_gralloc.c
+index 960986fb89e..735adee744d 100644
+--- a/src/util/u_gralloc/u_gralloc.c
++++ b/src/util/u_gralloc/u_gralloc.c
+@@ -28,6 +28,8 @@ static const struct u_grallocs {
+ #ifdef USE_IMAPPER4_METADATA_API
+    {.type = U_GRALLOC_TYPE_GRALLOC4, .create = u_gralloc_imapper_api_create},
+ #endif /* USE_IMAPPER4_METADATA_API */
++   /* IMapper 5 through its stable C API (no libui): Android 15+ Qualcomm phones */
++   {.type = U_GRALLOC_TYPE_AIMAPPER, .create = u_gralloc_aimapper_create},
+    {.type = U_GRALLOC_TYPE_LIBDRM, .create = u_gralloc_libdrm_create},
+    {.type = U_GRALLOC_TYPE_QCOM, .create = u_gralloc_qcom_create},
+    {.type = U_GRALLOC_TYPE_FALLBACK, .create = u_gralloc_fallback_create},
+@@ -154,3 +156,12 @@ u_gralloc_get_type(struct u_gralloc *gralloc)
+ {
+    return gralloc->type;
+ }
++
++int
++u_gralloc_get_compression_usage(struct u_gralloc *gralloc, uint64_t *out_usage)
++{
++   if (!gralloc || !gralloc->ops.get_compression_usage)
++      return -ENOTSUP;
++
++   return gralloc->ops.get_compression_usage(gralloc, out_usage);
++}
+diff --git a/src/util/u_gralloc/u_gralloc.h b/src/util/u_gralloc/u_gralloc.h
+index 2b93db1498b..3ddb0c12848 100644
+--- a/src/util/u_gralloc/u_gralloc.h
++++ b/src/util/u_gralloc/u_gralloc.h
+@@ -58,6 +58,7 @@ enum u_gralloc_type {
+    U_GRALLOC_TYPE_LIBDRM,
+    U_GRALLOC_TYPE_QCOM,
+    U_GRALLOC_TYPE_FALLBACK,
++   U_GRALLOC_TYPE_AIMAPPER,
+    U_GRALLOC_TYPE_COUNT,
+ };
+ 
+@@ -80,6 +81,9 @@ int u_gralloc_get_front_rendering_usage(struct u_gralloc *gralloc,
+ 
+ int u_gralloc_get_type(struct u_gralloc *gralloc);
+ 
++int u_gralloc_get_compression_usage(struct u_gralloc *gralloc,
++                                    uint64_t *out_usage);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/util/u_gralloc/u_gralloc_aimapper.c b/src/util/u_gralloc/u_gralloc_aimapper.c
+new file mode 100644
+index 00000000000..2e32d8a5dc0
+--- /dev/null
++++ b/src/util/u_gralloc/u_gralloc_aimapper.c
+@@ -0,0 +1,419 @@
++/*
++ * Mesa 3-D graphics library
++ *
++ * Copyright (C) 2026 Swap2-Native
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * u_gralloc backend for the IMapper 5 "stable C" API, without libui: the
++ * vendor's mapper library (mapper.<suffix>.so in the vendor's hw folder) is
++ * loaded into the sphal namespace through libvndksupport, as libui's Gralloc5
++ * does, and its AIMapper_loadIMapper gives the function table. Android 15 and
++ * later only have this mapper on Qualcomm phones (no gralloc HAL module for
++ * u_gralloc_qcom, and a handle layout u_gralloc_fallback does not know), so a
++ * build against android-stub would otherwise not know a buffer's layout: UBWC
++ * swapchain buffers were then drawn as linear ones.
++ *
++ * The declarations below follow AOSP's
++ * hardware/interfaces/graphics/mapper/stable-c/include/android/hardware/graphics/mapper/IMapper.h
++ * (the ABI only; functions this backend does not call are kept as plain
++ * pointers so the table's layout is right).
++ */
++
++#include <dirent.h>
++#include <dlfcn.h>
++#include <errno.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "drm-uapi/drm_fourcc.h"
++#include "util/log.h"
++#include "util/u_memory.h"
++
++#include "u_gralloc_internal.h"
++
++typedef int32_t aimapper_error;   /* AIMapper_Error: NONE = 0 */
++enum { AIMAPPER_VERSION_5 = 5 };
++
++typedef struct {
++   aimapper_error (*importBuffer)(const native_handle_t *handle, buffer_handle_t *out);
++   aimapper_error (*freeBuffer)(buffer_handle_t buffer);
++   void *getTransportSize;
++   void *lock;
++   void *unlock;
++   void *flushLockedBuffer;
++   void *rereadLockedBuffer;
++   void *getMetadata;
++   int32_t (*getStandardMetadata)(buffer_handle_t buffer, int64_t type, void *dest, size_t size);
++   void *setMetadata;
++   void *setStandardMetadata;
++   void *listSupportedMetadataTypes;
++   void *dumpBuffer;
++   void *dumpAllBuffers;
++   void *getReservedRegion;
++} aimapper_v5;
++
++typedef struct {
++   _Alignas(_Alignof(max_align_t)) uint32_t version;
++   aimapper_v5 v5;
++} aimapper;
++
++/* StandardMetadataType */
++enum {
++   SMT_PIXEL_FORMAT_FOURCC = 7,
++   SMT_PIXEL_FORMAT_MODIFIER = 8,
++   SMT_ALLOCATION_SIZE = 10,
++   SMT_COMPRESSION = 12,
++   SMT_PLANE_LAYOUTS = 15,
++   SMT_LAYER_COUNT = 5,
++};
++
++struct aimapper_gralloc {
++   struct u_gralloc base;
++   void *lib;
++   aimapper *mapper;
++   bool qti; /* Qualcomm's mapper: its allocator makes UBWC buffers on request */
++   struct u_gralloc *fallback; /* color info and front rendering usage */
++   int logged;
++};
++
++/* Little-endian reader of the standard metadata encoding: integers are 8
++ * bytes (FOURCC 4), strings and vectors are an 8-byte count and the items.
++ */
++struct rd {
++   const uint8_t *p;
++   size_t n, at;
++   bool bad;
++};
++
++static int64_t
++rd_i64(struct rd *r)
++{
++   if (r->at + 8 > r->n) {
++      r->bad = true;
++      return 0;
++   }
++   int64_t v;
++   memcpy(&v, r->p + r->at, 8);
++   r->at += 8;
++   return v;
++}
++
++static void
++rd_string(struct rd *r, char *out, size_t cap)
++{
++   int64_t len = rd_i64(r);
++   if (r->bad || len < 0 || r->at + (size_t)len > r->n) {
++      r->bad = true;
++      if (cap)
++         out[0] = 0;
++      return;
++   }
++   size_t k = (size_t)len < cap - 1 ? (size_t)len : cap - 1;
++   memcpy(out, r->p + r->at, k);
++   out[k] = 0;
++   r->at += len;
++}
++
++/* A standard metadata value, as the mapper encodes it: its type first (the
++ * name "android.hardware.graphics.common.StandardMetadataType" and the type's
++ * number, as the gralloc4 encoding does; measured on QTI's mapper.qti.so),
++ * then the value. Returns the value's bytes moved to the start of buf, or -1.
++ */
++static int
++get_std(struct aimapper_gralloc *gr, buffer_handle_t b, int64_t type, uint8_t *buf, size_t cap)
++{
++   static const char std_name[] = "android.hardware.graphics.common.StandardMetadataType";
++   int32_t n = gr->mapper->v5.getStandardMetadata(b, type, buf, cap);
++   if (n < 0 || (size_t)n > cap)
++      return -1;
++   const size_t nl = sizeof(std_name) - 1;
++   int64_t len;
++   if ((size_t)n >= 8 + nl + 8) {
++      memcpy(&len, buf, 8);
++      if (len == (int64_t)nl && !memcmp(buf + 8, std_name, nl)) {
++         int64_t t;
++         memcpy(&t, buf + 8 + nl, 8);
++         if (t != type)
++            return -1;
++         size_t skip = 8 + nl + 8;
++         memmove(buf, buf + skip, n - skip);
++         return n - (int)skip;
++      }
++   }
++   return n; /* no type header: the value alone */
++}
++
++struct plane {
++   int64_t offset, stride, total;
++};
++
++static int
++aimapper_get_buffer_basic_info(struct u_gralloc *gralloc,
++                               struct u_gralloc_buffer_handle *hnd,
++                               struct u_gralloc_buffer_basic_info *out)
++{
++   struct aimapper_gralloc *gr = (struct aimapper_gralloc *)gralloc;
++   if (!hnd->handle || hnd->handle->numFds < 1)
++      return -EINVAL;
++
++   buffer_handle_t b = NULL;
++   if (gr->mapper->v5.importBuffer(hnd->handle, &b) != 0 || !b)
++      return gr->fallback ? u_gralloc_get_buffer_basic_info(gr->fallback, hnd, out) : -EINVAL;
++
++   uint8_t buf[2048];
++   uint32_t fourcc = 0;
++   uint64_t modifier = DRM_FORMAT_MOD_INVALID, alloc_size = 0, layers = 1;
++   char comp_name[96] = "";
++   int64_t comp_value = 0;
++   struct plane planes[4];
++   int nplanes = 0;
++
++   int n = get_std(gr, b, SMT_PIXEL_FORMAT_FOURCC, buf, sizeof(buf));
++   if (n >= 4)
++      memcpy(&fourcc, buf, 4);
++   n = get_std(gr, b, SMT_PIXEL_FORMAT_MODIFIER, buf, sizeof(buf));
++   if (n >= 8)
++      memcpy(&modifier, buf, 8);
++   n = get_std(gr, b, SMT_ALLOCATION_SIZE, buf, sizeof(buf));
++   if (n >= 8)
++      memcpy(&alloc_size, buf, 8);
++   n = get_std(gr, b, SMT_LAYER_COUNT, buf, sizeof(buf));
++   if (n >= 8)
++      memcpy(&layers, buf, 8);
++   n = get_std(gr, b, SMT_COMPRESSION, buf, sizeof(buf));
++   if (n > 0) {
++      struct rd r = {buf, (size_t)n, 0, false};
++      rd_string(&r, comp_name, sizeof(comp_name));
++      comp_value = rd_i64(&r);
++      if (r.bad)
++         comp_name[0] = 0;
++   }
++
++   /* PLANE_LAYOUTS: vector<PlaneLayout>; a PlaneLayout is its components
++    * (vector of {ExtendableType type, offsetInBits, sizeInBits}), then
++    * offsetInBytes, sampleIncrementInBits, strideInBytes, widthInSamples,
++    * heightInSamples, totalSizeInBytes, horizontalSubsampling,
++    * verticalSubsampling.
++    */
++   n = get_std(gr, b, SMT_PLANE_LAYOUTS, buf, sizeof(buf));
++   bool layout_ok = false;
++   if (n > 0) {
++      struct rd r = {buf, (size_t)n, 0, false};
++      int64_t count = rd_i64(&r);
++      for (int64_t i = 0; i < count && !r.bad; i++) {
++         int64_t ncomp = rd_i64(&r);
++         for (int64_t c = 0; c < ncomp && !r.bad; c++) {
++            char name[96];
++            rd_string(&r, name, sizeof(name));
++            rd_i64(&r); /* type value */
++            rd_i64(&r); /* offsetInBits */
++            rd_i64(&r); /* sizeInBits */
++         }
++         struct plane p;
++         p.offset = rd_i64(&r);
++         rd_i64(&r); /* sampleIncrementInBits */
++         p.stride = rd_i64(&r);
++         rd_i64(&r); /* widthInSamples */
++         rd_i64(&r); /* heightInSamples */
++         p.total = rd_i64(&r);
++         rd_i64(&r); /* horizontalSubsampling */
++         rd_i64(&r); /* verticalSubsampling */
++         if (!r.bad && nplanes < 4)
++            planes[nplanes++] = p;
++      }
++      layout_ok = !r.bad && r.at == r.n && count == nplanes && nplanes > 0;
++   }
++
++   if (gr->logged < 6) {
++      gr->logged++;
++      mesa_logi("aimapper: hal_format %d fourcc %.4s modifier 0x%llx compression %s=%lld planes %d%s: "
++                "@%lld/%lld +%lld, @%lld/%lld +%lld (alloc %llu, layers %llu)",
++                hnd->hal_format, (const char *)&fourcc, (unsigned long long)modifier,
++                comp_name[0] ? comp_name : "-", (long long)comp_value, nplanes,
++                layout_ok ? "" : " (layout not decoded)",
++                nplanes > 0 ? (long long)planes[0].offset : -1, nplanes > 0 ? (long long)planes[0].stride : -1,
++                nplanes > 0 ? (long long)planes[0].total : -1,
++                nplanes > 1 ? (long long)planes[1].offset : -1, nplanes > 1 ? (long long)planes[1].stride : -1,
++                nplanes > 1 ? (long long)planes[1].total : -1,
++                (unsigned long long)alloc_size, (unsigned long long)layers);
++   }
++
++   gr->mapper->v5.freeBuffer(b);
++
++   /* QTI's mapper gives no PIXEL_FORMAT_FOURCC for a UBWC buffer (there is
++    * no linear DRM format to name); the handle's HAL format says it.
++    */
++   if (!fourcc)
++      fourcc = get_fourcc_from_hal_format(hnd->hal_format);
++
++   if (!layout_ok || !fourcc) {
++      /* nothing usable: the legacy helpers (the stride given by the window) */
++      return gr->fallback ? u_gralloc_get_buffer_basic_info(gr->fallback, hnd, out) : -EINVAL;
++   }
++
++   bool compressed = modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED;
++   /* COMPRESSION: the standard type's NONE (0) is uncompressed; another
++    * value or a vendor's type (QTI's UBWC kinds) is compressed.
++    */
++   if (comp_name[0] &&
++       (strcmp(comp_name, "android.hardware.graphics.common.Compression") || comp_value != 0))
++      compressed = true;
++   /* An RGB buffer laid out as more than one plane is UBWC: the metadata
++    * plane, then the pixels. Turnip takes it as one plane starting at the
++    * metadata, with the pixels' row pitch.
++    */
++   bool rgb = !is_hal_format_yuv(hnd->hal_format);
++   if (!compressed && rgb && nplanes > 1)
++      compressed = true;
++
++   memset(out, 0, sizeof(*out));
++   out->drm_fourcc = fourcc;
++   out->alloc_size = alloc_size;
++   out->layer_count = layers ? layers : 1;
++   if (compressed && rgb) {
++      int64_t start = planes[0].offset;
++      int data = 0;
++      for (int i = 1; i < nplanes; i++) {
++         if (planes[i].offset < start)
++            start = planes[i].offset;
++         if (planes[i].total > planes[data].total)
++            data = i; /* the pixels: the largest plane */
++      }
++      out->modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
++      out->num_planes = 1;
++      out->fds[0] = hnd->handle->data[0];
++      out->offsets[0] = (int)start;
++      out->strides[0] = (int)planes[data].stride;
++   } else {
++      out->modifier = modifier == DRM_FORMAT_MOD_INVALID ? DRM_FORMAT_MOD_LINEAR : modifier;
++      out->num_planes = nplanes;
++      for (int i = 0; i < nplanes; i++) {
++         out->fds[i] = hnd->handle->data[0];
++         out->offsets[i] = (int)planes[i].offset;
++         out->strides[i] = (int)planes[i].stride;
++      }
++   }
++   return 0;
++}
++
++static int
++aimapper_get_buffer_color_info(struct u_gralloc *gralloc,
++                               struct u_gralloc_buffer_handle *hnd,
++                               struct u_gralloc_buffer_color_info *out)
++{
++   struct aimapper_gralloc *gr = (struct aimapper_gralloc *)gralloc;
++   return gr->fallback ? u_gralloc_get_buffer_color_info(gr->fallback, hnd, out) : -ENOTSUP;
++}
++
++static int
++aimapper_get_front_rendering_usage(struct u_gralloc *gralloc, uint64_t *out_usage)
++{
++   struct aimapper_gralloc *gr = (struct aimapper_gralloc *)gralloc;
++   return gr->fallback ? u_gralloc_get_front_rendering_usage(gr->fallback, out_usage) : -ENOTSUP;
++}
++
++/* QTI's allocator makes a UBWC buffer when the client asks with
++ * GRALLOC_USAGE_PRIVATE_ALLOC_UBWC (GRALLOC_USAGE_PRIVATE_0, bit 28), as
++ * Qualcomm's own Vulkan driver does for its swapchains; other vendors' bit
++ * 28 means something else.
++ */
++static int
++aimapper_get_compression_usage(struct u_gralloc *gralloc, uint64_t *out_usage)
++{
++   struct aimapper_gralloc *gr = (struct aimapper_gralloc *)gralloc;
++   if (!gr->qti)
++      return -ENOTSUP;
++   *out_usage = 1ull << 28;
++   return 0;
++}
++
++static int
++aimapper_destroy(struct u_gralloc *gralloc)
++{
++   struct aimapper_gralloc *gr = (struct aimapper_gralloc *)gralloc;
++   if (gr->fallback)
++      gr->fallback->ops.destroy(gr->fallback); /* made directly, not through u_gralloc_create's cache */
++   /* the mapper library stays loaded: it may hold buffers' state */
++   FREE(gr);
++   return 0;
++}
++
++/* mapper.<suffix>.so in the vendor's hw folder (libui asks the allocator
++ * service for the suffix; without binder, the folder tells)
++ */
++static bool
++find_mapper(char *out, size_t cap)
++{
++   static const char *const dirs[] = {"/vendor/lib64/hw", "/vendor/lib/hw"};
++   for (unsigned d = 0; d < ARRAY_SIZE(dirs); d++) {
++      DIR *dir = opendir(dirs[d]);
++      if (!dir)
++         continue;
++      struct dirent *e;
++      bool found = false;
++      while ((e = readdir(dir))) {
++         size_t l = strlen(e->d_name);
++         if (l > 10 && !strncmp(e->d_name, "mapper.", 7) && !strcmp(e->d_name + l - 3, ".so")) {
++            snprintf(out, cap, "%s", e->d_name);
++            found = true;
++            break;
++         }
++      }
++      closedir(dir);
++      if (found)
++         return true;
++   }
++   return false;
++}
++
++struct u_gralloc *
++u_gralloc_aimapper_create(void)
++{
++   char name[128];
++   if (!find_mapper(name, sizeof(name)))
++      return NULL;
++
++   void *lib = NULL;
++   void *vndk = dlopen("libvndksupport.so", RTLD_NOW | RTLD_LOCAL);
++   if (vndk) {
++      void *(*load_sphal)(const char *, int) =
++         (void *(*)(const char *, int))dlsym(vndk, "android_load_sphal_library");
++      if (load_sphal)
++         lib = load_sphal(name, RTLD_NOW | RTLD_LOCAL);
++   }
++   if (!lib) {
++      char path[192];
++      snprintf(path, sizeof(path), "/vendor/lib64/hw/%s", name);
++      lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
++   }
++   if (!lib) {
++      mesa_logw("aimapper: %s not loaded (%s)", name, dlerror());
++      return NULL;
++   }
++
++   int32_t (*load)(aimapper **) = (int32_t (*)(aimapper **))dlsym(lib, "AIMapper_loadIMapper");
++   aimapper *m = NULL;
++   if (!load || load(&m) != 0 || !m || m->version < AIMAPPER_VERSION_5 ||
++       !m->v5.importBuffer || !m->v5.freeBuffer || !m->v5.getStandardMetadata) {
++      mesa_logw("aimapper: %s has no usable AIMapper (version %u)", name, m ? m->version : 0);
++      return NULL;
++   }
++
++   struct aimapper_gralloc *gr = CALLOC_STRUCT(aimapper_gralloc);
++   gr->base.type = U_GRALLOC_TYPE_AIMAPPER;
++   gr->base.ops.get_buffer_basic_info = aimapper_get_buffer_basic_info;
++   gr->base.ops.get_buffer_color_info = aimapper_get_buffer_color_info;
++   gr->base.ops.get_front_rendering_usage = aimapper_get_front_rendering_usage;
++   gr->base.ops.destroy = aimapper_destroy;
++   gr->base.ops.get_compression_usage = aimapper_get_compression_usage;
++   gr->lib = lib;
++   gr->mapper = m;
++   gr->qti = !strncmp(name, "mapper.qti", 10);
++   gr->fallback = u_gralloc_fallback_create();
++   mesa_logi("Using IMapper %u stable C API (%s)", m->version, name);
++   return &gr->base;
++}
+diff --git a/src/util/u_gralloc/u_gralloc_internal.h b/src/util/u_gralloc/u_gralloc_internal.h
+index 80975607f44..6467b548191 100644
+--- a/src/util/u_gralloc/u_gralloc_internal.h
++++ b/src/util/u_gralloc/u_gralloc_internal.h
+@@ -24,6 +24,8 @@ struct u_gralloc_ops {
+    int (*get_front_rendering_usage)(struct u_gralloc *gralloc,
+                                     uint64_t *out_usage);
+    int (*destroy)(struct u_gralloc *gralloc);
++   /* the usage bits that ask this allocator for a compressed (UBWC) buffer */
++   int (*get_compression_usage)(struct u_gralloc *gralloc, uint64_t *out_usage);
+ };
+ 
+ struct u_gralloc {
+@@ -38,6 +40,7 @@ extern struct u_gralloc *u_gralloc_imapper_api_create(void);
+ extern struct u_gralloc *u_gralloc_qcom_create(void);
+ extern struct u_gralloc *u_gralloc_libdrm_create(void);
+ extern struct u_gralloc *u_gralloc_fallback_create(void);
++extern struct u_gralloc *u_gralloc_aimapper_create(void);
+ 
+ /* Helpers for legacy grallocs */
+ struct android_ycbcr;
