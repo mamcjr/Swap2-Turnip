@@ -10,7 +10,7 @@ API=${API:-29}            # NDK target: the oldest Android the .so loads on
 SDK=${SDK:-36}            # Mesa platform-sdk-version: extensions Mesa hides on Android below their level (vk_extensions.py); 36 = what V39 exposes
 NAME=${1:-Swap2-Turnip}
 DESC=${2:-Turnip built by Swap2-Native, A8xx Android/KGSL}
-SRC=$TS/mesa
+SRC=${SRC:-$TS/mesa}   # (rel-worktree.sh: $TS/mesa-rel, the shipping patches only)
 BUILD=${BUILD:-$TS/build-android}
 OUT=${OUT:-/mnt/d/Projetos/Jogos/Android/turnip-swap2/out}
 TC=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin

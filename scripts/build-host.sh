@@ -5,7 +5,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/env.sh"
-SRC=$TS/mesa
+SRC=${SRC:-$TS/mesa}
 BUILD=${BUILD:-$TS/build-host}
 if [ ! -f "$BUILD/build.ninja" ]; then
   CC=clang CXX=clang++ meson setup "$BUILD" "$SRC" \

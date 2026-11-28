@@ -1,0 +1,71 @@
+diff --git a/src/freedreno/ir3/ir3_lower_subgroups.c b/src/freedreno/ir3/ir3_lower_subgroups.c
+index c3542897556..e9f372dbda4 100644
+--- a/src/freedreno/ir3/ir3_lower_subgroups.c
++++ b/src/freedreno/ir3/ir3_lower_subgroups.c
+@@ -809,7 +809,7 @@ shuffle_to_uniform(nir_builder *b, nir_intrinsic_op op, struct nir_def *val,
+  */
+ static nir_def *
+ make_shuffle_uniform(nir_builder *b, nir_def *val, nir_def *index,
+-                     nir_intrinsic_op op)
++                     nir_intrinsic_op op, nir_def *abs_index)
+ {
+    nir_variable *done =
+       nir_local_variable_create(b->impl, glsl_bool_type(), "done");
+@@ -831,6 +831,28 @@ make_shuffle_uniform(nir_builder *b, nir_def *val, nir_def *index,
+       }
+       nir_pop_if(b, nif);
+ 
++      if (abs_index) {
++         /* Swap2-Turnip: the same pass also serves every pending lane that
++          * reads the absolute lane the first pending lane reads (a movs with a
++          * uniform lane), so a shuffle with few distinct source lanes but many
++          * distinct relative offsets (a broadcast from a lane chosen per 32-lane
++          * half) takes one pass per source lane.
++          */
++         nir_def *next_abs = nir_read_invocation_cond_ir3(
++            b, abs_index->bit_size, abs_index, nir_inot(b, nir_load_var(b, done)));
++         next_abs->divergent = false;
++         nir_def *read = nir_read_invocation(b, val, next_abs);
++
++         nir_if *nif2 = nir_push_if(
++            b, nir_iand(b, nir_inot(b, nir_load_var(b, done)),
++                        nir_ieq(b, abs_index, next_abs)));
++         {
++            nir_store_var(b, result, read, 1);
++            nir_store_var(b, done, nir_imm_true(b), 1);
++         }
++         nir_pop_if(b, nif2);
++      }
++
+       nir_break_if(b, nir_vote_all(b, 1, nir_load_var(b, done)));
+    }
+    nir_pop_loop(b, loop);
+@@ -844,8 +866,12 @@ lower_shuffle(nir_builder *b, nir_instr *instr, void *data)
+    nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+    nir_def *val = intrin->src[0].ssa;
+    nir_def *index = intrin->src[1].ssa;
++   nir_def *abs_index = NULL;
+ 
+    if (intrin->intrinsic == nir_intrinsic_shuffle) {
++      const struct ir3_shader *shader = data;
++      if (shader->compiler->info->props.has_movs)
++         abs_index = index;
+       /* The hw only does relative shuffles/rotates so transform shuffle(val, x)
+        * into rotate(val, x - gl_SubgroupInvocationID) which is valid since we
+        * make sure to only use it with uniform indices.
+@@ -857,7 +883,7 @@ lower_shuffle(nir_builder *b, nir_instr *instr, void *data)
+       return shuffle_to_uniform(b, intrin->intrinsic, val, index);
+    }
+ 
+-   return make_shuffle_uniform(b, val, index, intrin->intrinsic);
++   return make_shuffle_uniform(b, val, index, intrin->intrinsic, abs_index);
+ }
+ 
+ /* Lower (relative) shuffles to be able to use the shfl instruction. One quirk
+@@ -874,5 +900,5 @@ ir3_nir_lower_shuffle(nir_shader *nir, struct ir3_shader *shader)
+ 
+    nir_divergence_analysis(nir);
+    return nir_shader_lower_instructions(nir, filter_shuffle, lower_shuffle,
+-                                        NULL);
++                                        shader);
+ }
